@@ -1,0 +1,17 @@
+name: Clone Releases
+on:
+  # kick off the job on demand
+  workflow_dispatch:
+  # and run on a schedule at 12:00AM on the first day of every month
+  schedule:
+    - cron: "0 0 1 * *"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run action
+        uses: andrewthetechie/gha-clone-releases@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          src_repo: andfoy/pywinpty
+          copy_assets: true

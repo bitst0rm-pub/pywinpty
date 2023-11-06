@@ -1,0 +1,127 @@
+name: Build Py3.8
+
+# This workflow runs when any of the following occur:
+# - A tag with semantic versioning is created by an actor
+# - A workflow is manually triggered by an actor
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows Py${{ matrix.PYTHON_VERSION }}
+    runs-on: windows-latest
+    if: ${{ github.actor == 'bitst0rm' }}
+
+    env:
+        PYTHON_VERSION: ${{ matrix.PYTHON_VERSION }}
+        RUNNER_OS: "windows"
+
+    strategy:
+        fail-fast: false
+        matrix:
+            PYTHON_VERSION: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+        - name: Checkout branch
+          uses: actions/checkout@v4
+
+        - name: Install latest Rust stable
+          uses: actions-rs/toolchain@v1
+          with:
+            toolchain: stable
+            target: x86_64-pc-windows-msvc
+            override: true
+            components: rustfmt, clippy
+
+        - name: Install miniconda
+          uses: conda-incubator/setup-miniconda@v2
+          with:
+            auto-update-conda: true
+            activate-environment: test
+            channels: conda-forge,defaults
+            python-version: ${{ matrix.PYTHON_VERSION }}
+
+        - name: Conda env info
+          shell: bash -l {0}
+          run: conda env list
+
+        - name: Install winpty
+          shell: bash -l {0}
+          run: conda install -y winpty
+
+        - name: Install build/test dependencies
+          shell: bash -l {0}
+          run: pip install maturin toml
+
+        - name: Copy winpty binaries to package
+          shell: bash -l {0}
+          run: bash -l .github/scripts/copy_winpty.sh
+
+        - name: Build dist distribution
+          shell: bash -l {0}
+          run: maturin build
+
+        - name: Extract Version from Git Tag
+          run: |
+            # This strips the git ref prefix from the version.
+            VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+            # This strips the "v" prefix from the tag name.
+            [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
+            # Set the version number as an environment variable
+            echo "rls_version=$VERSION" >> $GITHUB_ENV
+          shell: bash -l {0}
+
+        - name: Set Release Name
+          run: |
+            CPV=$(echo "${{ matrix.PYTHON_VERSION }}" | sed -e 's/\.//')
+            echo "rls_name=pywinpty-${{ env.rls_version }}-cp${CPV}-win_x64" >> $GITHUB_ENV
+            echo "branch_name=pywinpty_${{ env.rls_version }}_cp${CPV}_win_x64" >> $GITHUB_ENV
+          shell: bash -l {0}
+
+        - name: Push to branch
+          run: |
+            echo "rls_path=./target/wheels/project/${{ env.branch_name }}" >> $GITHUB_ENV
+
+            mkdir -p /tmp/pywinpty
+            LICENSE=$(echo LICENSE*) && [ -f "$LICENSE" ] && cp "$LICENSE" /tmp/pywinpty
+            cd ./target/wheels
+
+            WHL=$(echo pywinpty*.whl)
+            unzip -d /tmp/pywinpty $WHL
+            rm -rf /tmp/pywinpty/*.dist-info
+
+            git config --global user.email bitst0rm@users.noreply.github.com
+            git config --global user.name bitst0rm
+            git clone https://${{github.actor}}:${{secrets.GITHUB_TOKEN}}@github.com/${{github.repository}}.git project
+            cd project
+
+            git checkout -b "${{ env.branch_name }}"
+            rm -rf {.github,.gitignore,*}
+            mkdir -p "${{ env.branch_name }}"
+            cp -r /tmp/pywinpty/* "${{ env.branch_name }}/"
+
+            git add -f -A
+            git commit -m "Build ${{ env.branch_name }}"
+            git push -f -u origin "${{ env.branch_name }}"
+          shell: bash -l {0}
+
+        - name: Create Tarball
+          run: tar -czvf ${{ env.rls_name }}.tar.gz -C . ${{ env.rls_path }} --transform "s,${{ env.rls_path }},${{ env.rls_name }}," --show-transformed-names
+          shell: bash -l {0}
+
+        - name: Upload Artifacts
+          uses: actions/upload-artifact@v3
+          with:
+            name: ${{ env.rls_name }}
+            path: ${{ env.rls_path }}
+
+        - name: Upload Binaries to Release
+          uses: svenstaro/upload-release-action@v2
+          with:
+            repo_token: ${{ secrets.GITHUB_TOKEN }}
+            file: ${{ env.rls_name }}.tar.gz
+            asset_name: ${{ env.rls_name }}.tar.gz
+            tag: ${{ github.ref }}
+            overwrite: false

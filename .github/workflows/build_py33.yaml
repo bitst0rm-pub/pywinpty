@@ -1,0 +1,163 @@
+name: Build Py3.3
+
+# This workflow runs when any of the following occur:
+# - A tag with semantic versioning is created by an actor
+# - A workflow is manually triggered by an actor
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build pywinpty 0.5.7
+    runs-on: windows-latest
+    if: ${{ github.actor == 'bitst0rm' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x32, x64]
+
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Miniconda
+        run: |
+          $env:PATH = "$env:CONDA;$env:CONDA\Scripts;$env:PATH"
+          conda init powershell
+
+      - name: Download winpty
+        run: |
+          (New-Object net.webclient).DownloadFile("https://github.com/bitst0rm-pub/winpty/releases/download/0.4.4-dev0/winpty-0.4.4-dev0-msys2-mingw-w64-win_${{ matrix.arch }}.tar.gz", "C:\winpty.tar.gz")
+          cd C:\
+          tar xzvf winpty.tar.gz
+          Get-ChildItem "winpty*msys2-mingw-w64-win*" | Rename-Item -NewName "winpty"
+
+      - name: Build pywinpty
+        run: |
+          conda config --set allow_conda_downgrades true
+          conda install conda=23.9.0 --channel anaconda --yes                 # win-32: v4.13.0,  win-64: v23.9.0
+
+          if ("${{ matrix.arch }}" -eq "x32") {
+            $env:CONDA_FORCE_32BIT = 1
+            $SUBDIR = "win-32"
+          } else {
+            $env:CONDA_FORCE_32BIT = 0
+            $SUBDIR = "win-64"
+          }
+
+          conda create --name py33_${{ matrix.arch }}
+          conda activate py33_${{ matrix.arch }}
+          conda config --env --set subdir $SUBDIR
+
+          conda install python=3.3.5 --channel free --yes                     # win-32: v3.3.5,   win-64: v3.3.5
+          conda install cython --channel anaconda --yes                       # win-32: v0.29.28, win-64: v3.0.0
+          conda install winpty --channel conda-forge --yes                    # win-32: v0.4.3,   win-64: v0.4.3
+          conda install m2w64-toolchain --channel msys2 --yes                 # win-32: v5.3.0,   win-64: v5.3.0
+          conda install libpython --channel anaconda --yes                    # win-32: v2.1,     win-64: v2.1
+          python -m pip install setuptools==39 --upgrade --ignore-installed
+
+          pip download pywinpty==0.5.7 --no-binary :all:
+          $FILE = $(Get-ChildItem pywinpty*tar.gz).name
+          tar xzvf $FILE
+          cd $($FILE -replace ".tar.gz", "")
+          $env:LIBRARY_INC = "C:\winpty\include\winpty"
+          $env:LIBRARY_LIB = "C:\winpty\lib"
+          python setup.py build_ext -i
+
+          $WINPTY_EXE = "C:\winpty\bin\winpty-agent.exe"
+          $WINPTY_DLL = "C:\winpty\bin\winpty.dll"
+
+          $MINGW_PATH = split-path -Path ((Get-Command gcc).Path)
+          echo "================================================"
+          conda info -a
+          echo('$MINGW_PATH: ' + $MINGW_PATH)
+          echo "================================================"
+          $LIB_GCC_32 = join-path $MINGW_PATH "libgcc_s_dw2-1.dll"
+          $LIB_GCC_64 = join-path $MINGW_PATH "libgcc_s_seh-1.dll"
+          $LIBPTHREAD = join-path $MINGW_PATH "libwinpthread-1.dll"
+
+          $FOLDER = "winpty\"
+          # Copy winpty binaries to winpty folder
+          copy-item $WINPTY_EXE $FOLDER
+          # copy-item $WINPTY_DEBUG $FOLDER
+          copy-item $WINPTY_DLL $FOLDER
+          copy-item $LIBPTHREAD $FOLDER
+          if ("${{ matrix.arch }}" -eq "x64") {
+              copy-item $LIB_GCC_64 $FOLDER
+          } else  {
+              copy-item $LIB_GCC_32 $FOLDER
+          }
+          python setup.py bdist_wheel
+
+      - name: Extract Version from Git Tag
+        run: |
+          # This strips the git ref prefix from the version.
+          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+          # This strips the "v" prefix from the tag name.
+          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
+          # Set the version number as an environment variable
+          echo "rls_version=$VERSION" >> $GITHUB_ENV
+        shell: bash -l {0}
+
+      - name: Set Release Name
+        run: |
+          echo "rls_name=pywinpty-${{ env.rls_version }}-cp335-win_${{ matrix.arch }}" >> $GITHUB_ENV
+          echo "branch_name=pywinpty_${{ env.rls_version }}_cp335_win_${{ matrix.arch }}" >> $GITHUB_ENV
+        shell: bash -l {0}
+
+      - name: Push to branch
+        run: |
+          FILE=$(echo pywinpty*.tar.gz)
+          DIR=${FILE%.tar.gz}
+          cd $DIR
+
+          echo "rls_path=$DIR/dist/project/${{ env.branch_name }}" >> $GITHUB_ENV
+
+          mkdir -p /tmp/pywinpty
+          LICENSE=$(echo LICENSE*) && [ -f "$LICENSE" ] && cp "$LICENSE" /tmp/pywinpty
+          cd dist
+
+          WHL=$(echo pywinpty*.whl)
+          unzip -d /tmp/pywinpty $WHL
+          rm -rf /tmp/pywinpty/*.dist-info
+
+          git config --global user.email bitst0rm@users.noreply.github.com
+          git config --global user.name bitst0rm
+          git clone https://${{github.actor}}:${{secrets.GITHUB_TOKEN}}@github.com/${{github.repository}}.git project
+          cd project
+
+          git checkout -b "${{ env.branch_name }}"
+          rm -rf {.github,.gitignore,*}
+          mkdir -p "${{ env.branch_name }}"
+          cp -r /tmp/pywinpty/* "${{ env.branch_name }}/"
+
+          git add -f -A
+          git commit -m "Build ${{ env.branch_name }}"
+          git push -f -u origin "${{ env.branch_name }}"
+        shell: bash -l {0}
+
+      - name: Create Tarball
+        run: tar -czvf ${{ env.rls_name }}.tar.gz -C . ${{ env.rls_path }} --transform "s,${{ env.rls_path }},${{ env.rls_name }}," --show-transformed-names
+        shell: bash -l {0}
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.rls_name }}
+          path: ${{ env.rls_path }}
+
+      - name: Upload Binaries to Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ env.rls_name }}.tar.gz
+          asset_name: ${{ env.rls_name }}.tar.gz
+          tag: ${{ github.ref }}
+          overwrite: false
